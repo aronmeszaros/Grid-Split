@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Grid Splitter",
     "author": "Your Name",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (3, 6, 0),
     "location": "View3D > N-Panel > Grid Splitter",
     "description": "Split meshes into grid using boolean operations",
@@ -12,7 +12,8 @@ bl_info = {
 
 import bpy
 import math
-from bpy.props import FloatProperty, StringProperty
+import time
+from bpy.props import FloatProperty, BoolProperty
 from bpy.types import Panel, Operator
 
 class GridSplitterProperties(bpy.types.PropertyGroup):
@@ -20,8 +21,18 @@ class GridSplitterProperties(bpy.types.PropertyGroup):
         name="Grid Size",
         description="Size of each grid cell in meters",
         default=2.0,
-        min=0.1,
-        max=10.0
+        min=0.1  # Only keep minimum limit
+    )
+    cutter_height: FloatProperty(
+        name="Cutter Height",
+        description="Height of the cutting volume",
+        default=0.3,
+        min=0.01  # Only keep minimum limit
+    )
+    use_fast_mode: BoolProperty(
+        name="Fast Mode",
+        description="Process faster but less reliably",
+        default=False
     )
 
 class VIEW3D_PT_grid_splitter(Panel):
@@ -35,6 +46,8 @@ class VIEW3D_PT_grid_splitter(Panel):
         scene = context.scene
         
         layout.prop(scene.grid_splitter, "grid_size")
+        layout.prop(scene.grid_splitter, "cutter_height")
+        layout.prop(scene.grid_splitter, "use_fast_mode")
         layout.operator("object.split_mesh_operator")
 
 class SplitMeshOperator(Operator):
@@ -42,20 +55,40 @@ class SplitMeshOperator(Operator):
     bl_label = "Split Mesh"
     bl_description = "Split mesh into grid using boolean operations"
     
-    def create_cutter(self, size, position):
+    def create_cutter(self, size, height, position):
         self.report({'INFO'}, f"Creating cutter at position {position}")
-        bpy.ops.mesh.primitive_cube_add(size=size)
+        bpy.ops.mesh.primitive_cube_add()
         cutter = bpy.context.active_object
+        cutter.scale = (size/2, size/2, height/2)
         cutter.location = position
+        bpy.ops.object.transform_apply(scale=True)
         return cutter
+    
+    def verify_boolean_result(self, obj):
+        """Check if boolean operation produced valid geometry"""
+        return len(obj.data.vertices) > 0 and len(obj.data.polygons) > 0
+    
+    def wait_for_boolean(self, context):
+        """Force Blender to complete pending operations"""
+        context.view_layer.update()
+        context.view_layer.depsgraph.update()
+        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
     def execute(self, context):
         if not context.active_object:
             self.report({'ERROR'}, "No active object selected")
             return {'CANCELLED'}
             
+        # Store start time for progress reporting
+        start_time = time.time()
+        
         original = context.active_object
         grid_size = context.scene.grid_splitter.grid_size
+        cutter_height = context.scene.grid_splitter.cutter_height
+        fast_mode = context.scene.grid_splitter.use_fast_mode
+        
+        # Apply all transformations to original
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         
         # Calculate grid dimensions
         dims = original.dimensions
@@ -65,20 +98,33 @@ class SplitMeshOperator(Operator):
         
         self.report({'INFO'}, f"Starting split into {cells_x}x{cells_y} grid ({total_cells} pieces)")
         
+        # Track failed operations for retry
+        failed_operations = []
+        
         # Create grid of boolean cutters
         current_cell = 0
         for i in range(cells_x):
             for j in range(cells_y):
                 current_cell += 1
-                self.report({'INFO'}, f"Processing piece {current_cell}/{total_cells} ({int(current_cell/total_cells*100)}%)")
                 
                 # Calculate position
                 pos_x = (i * grid_size) - (dims.x / 2) + (grid_size / 2)
                 pos_y = (j * grid_size) - (dims.y / 2) + (grid_size / 2)
                 pos_z = original.location.z
                 
+                # Progress report with time estimate
+                elapsed_time = time.time() - start_time
+                avg_time_per_cell = elapsed_time / current_cell
+                remaining_cells = total_cells - current_cell
+                estimated_remaining = avg_time_per_cell * remaining_cells
+                
+                self.report({'INFO'}, 
+                    f"Processing piece {current_cell}/{total_cells} "
+                    f"({int(current_cell/total_cells*100)}%) - "
+                    f"Est. remaining time: {int(estimated_remaining/60)}m {int(estimated_remaining%60)}s")
+                
                 # Create cutter
-                cutter = self.create_cutter(grid_size, (pos_x, pos_y, pos_z))
+                cutter = self.create_cutter(grid_size, cutter_height, (pos_x, pos_y, pos_z))
                 
                 # Create copy of original
                 bpy.ops.object.select_all(action='DESELECT')
@@ -94,21 +140,51 @@ class SplitMeshOperator(Operator):
                 bool_mod = current_piece.modifiers.new(name="Boolean", type='BOOLEAN')
                 bool_mod.object = cutter
                 bool_mod.operation = 'INTERSECT'
+                bool_mod.solver = 'EXACT'  # Use exact solver for better reliability
+                
+                if not fast_mode:
+                    # Wait for boolean operation to complete
+                    self.wait_for_boolean(context)
                 
                 # Apply modifier
-                bpy.ops.object.modifier_apply(modifier="Boolean")
+                try:
+                    bpy.ops.object.modifier_apply(modifier="Boolean")
+                    
+                    # Verify result
+                    if not self.verify_boolean_result(current_piece):
+                        failed_operations.append({
+                            'position': (i, j),
+                            'coords': (pos_x, pos_y, pos_z)
+                        })
+                        self.report({'WARNING'}, f"Failed to create valid geometry for piece {i+1}_{j+1}")
+                except Exception as e:
+                    failed_operations.append({
+                        'position': (i, j),
+                        'coords': (pos_x, pos_y, pos_z)
+                    })
+                    self.report({'WARNING'}, f"Error processing piece {i+1}_{j+1}: {str(e)}")
                 
                 # Delete cutter
                 bpy.ops.object.select_all(action='DESELECT')
                 cutter.select_set(True)
                 bpy.ops.object.delete()
         
+        # Report failed operations
+        if failed_operations:
+            self.report({'WARNING'}, 
+                f"Failed to process {len(failed_operations)} pieces. "
+                "These areas may appear as 'holes' in the final result.")
+            
         # Delete original
         bpy.ops.object.select_all(action='DESELECT')
         original.select_set(True)
         bpy.ops.object.delete()
         
-        self.report({'INFO'}, "Splitting completed successfully!")
+        total_time = time.time() - start_time
+        self.report({'INFO'}, 
+            f"Splitting completed in {int(total_time/60)}m {int(total_time%60)}s "
+            f"with {len(failed_operations)} failed operations")
+        
         return {'FINISHED'}
 
 classes = (

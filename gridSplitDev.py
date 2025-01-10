@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Grid Splitter",
     "author": "Your Name",
-    "version": (1, 1),
+    "version": (1, 3),
     "blender": (3, 6, 0),
     "location": "View3D > N-Panel > Grid Splitter",
     "description": "Split meshes into grid using boolean operations",
@@ -21,13 +21,13 @@ class GridSplitterProperties(bpy.types.PropertyGroup):
         name="Grid Size",
         description="Size of each grid cell in meters",
         default=2.0,
-        min=0.1  # Only keep minimum limit
+        min=0.1
     )
     cutter_height: FloatProperty(
         name="Cutter Height",
         description="Height of the cutting volume",
         default=0.3,
-        min=0.01  # Only keep minimum limit
+        min=0.01
     )
     use_fast_mode: BoolProperty(
         name="Fast Mode",
@@ -74,6 +74,49 @@ class SplitMeshOperator(Operator):
         context.view_layer.depsgraph.update()
         bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
+    def retry_boolean_operation(self, current_piece, cutter, context, position_offset=0.0):
+        """Attempt boolean operation with different settings"""
+        # Try with exact solver first
+        bool_mod = current_piece.modifiers.new(name="Boolean", type='BOOLEAN')
+        bool_mod.object = cutter
+        bool_mod.operation = 'INTERSECT'
+        bool_mod.solver = 'EXACT'
+        
+        try:
+            bpy.ops.object.modifier_apply(modifier="Boolean")
+            if self.verify_boolean_result(current_piece):
+                return True
+        except:
+            pass
+            
+        # If exact solver failed, try with fast solver
+        bool_mod = current_piece.modifiers.new(name="Boolean", type='BOOLEAN')
+        bool_mod.object = cutter
+        bool_mod.operation = 'INTERSECT'
+        bool_mod.solver = 'FAST'
+        
+        try:
+            bpy.ops.object.modifier_apply(modifier="Boolean")
+            if self.verify_boolean_result(current_piece):
+                return True
+        except:
+            pass
+            
+        # If both solvers failed, try with slight position offset
+        if position_offset == 0.0:
+            cutter.location.x += 0.001
+            cutter.location.y += 0.001
+            return self.retry_boolean_operation(current_piece, cutter, context, 0.001)
+            
+        return False
+
+    def cleanup_empty_pieces(self, context, grid_collection):
+        """Remove pieces with no valid geometry"""
+        for obj in grid_collection.objects:
+            if not self.verify_boolean_result(obj):
+                grid_collection.objects.unlink(obj)
+                bpy.data.objects.remove(obj, do_unlink=True)
+
     def execute(self, context):
         if not context.active_object:
             self.report({'ERROR'}, "No active object selected")
@@ -86,6 +129,17 @@ class SplitMeshOperator(Operator):
         grid_size = context.scene.grid_splitter.grid_size
         cutter_height = context.scene.grid_splitter.cutter_height
         fast_mode = context.scene.grid_splitter.use_fast_mode
+        
+        # Clean up existing collection if it exists
+        if "Grid_Pieces" in bpy.data.collections:
+            grid_collection = bpy.data.collections["Grid_Pieces"]
+            for obj in grid_collection.objects:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            bpy.data.collections.remove(grid_collection)
+        
+        # Create new collection for the grid pieces
+        grid_collection = bpy.data.collections.new(name="Grid_Pieces")
+        bpy.context.scene.collection.children.link(grid_collection)
         
         # Apply all transformations to original
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
@@ -133,30 +187,31 @@ class SplitMeshOperator(Operator):
                 bpy.ops.object.duplicate()
                 current_piece = context.active_object
                 
+                # Handle collections properly
+                for coll in current_piece.users_collection:
+                    coll.objects.unlink(current_piece)
+                grid_collection.objects.link(current_piece)
+                
                 # Name the piece
                 current_piece.name = f"Grid_Piece_{i+1}_{j+1}"
                 
-                # Apply boolean intersection
-                bool_mod = current_piece.modifiers.new(name="Boolean", type='BOOLEAN')
-                bool_mod.object = cutter
-                bool_mod.operation = 'INTERSECT'
-                bool_mod.solver = 'EXACT'  # Use exact solver for better reliability
-                
-                if not fast_mode:
-                    # Wait for boolean operation to complete
-                    self.wait_for_boolean(context)
-                
-                # Apply modifier
+                # Apply boolean operation with retry mechanism
                 try:
-                    bpy.ops.object.modifier_apply(modifier="Boolean")
-                    
-                    # Verify result
-                    if not self.verify_boolean_result(current_piece):
+                    if not self.retry_boolean_operation(current_piece, cutter, context):
                         failed_operations.append({
                             'position': (i, j),
-                            'coords': (pos_x, pos_y, pos_z)
+                            'coords': (pos_x, pos_y, pos_z),
+                            'piece_name': f"Grid_Piece_{i+1}_{j+1}"
                         })
-                        self.report({'WARNING'}, f"Failed to create valid geometry for piece {i+1}_{j+1}")
+                        self.report({'WARNING'}, 
+                            f"Failed to create valid geometry for piece {i+1}_{j+1} "
+                            f"at position ({pos_x:.2f}, {pos_y:.2f}, {pos_z:.2f})")
+                        
+                        # Save failed piece coordinates to a text file
+                        bpy.data.texts.new(name=f"failed_piece_{i+1}_{j+1}_coords.txt").write(
+                            f"Position: ({pos_x}, {pos_y}, {pos_z})\n"
+                            f"Grid position: ({i+1}, {j+1})"
+                        )
                 except Exception as e:
                     failed_operations.append({
                         'position': (i, j),
@@ -169,16 +224,23 @@ class SplitMeshOperator(Operator):
                 cutter.select_set(True)
                 bpy.ops.object.delete()
         
+        # Clean up empty pieces
+        self.cleanup_empty_pieces(context, grid_collection)
+        
+        # Hide original instead of deleting it
+        original.hide_viewport = True
+        original.hide_render = True
+        
+        # Move original to grid collection
+        for coll in original.users_collection:
+            coll.objects.unlink(original)
+        grid_collection.objects.link(original)
+        
         # Report failed operations
         if failed_operations:
             self.report({'WARNING'}, 
                 f"Failed to process {len(failed_operations)} pieces. "
                 "These areas may appear as 'holes' in the final result.")
-            
-        # Delete original
-        bpy.ops.object.select_all(action='DESELECT')
-        original.select_set(True)
-        bpy.ops.object.delete()
         
         total_time = time.time() - start_time
         self.report({'INFO'}, 
